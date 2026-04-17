@@ -1,1 +1,531 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Trophy, Plus, X, GripVertical, Gamepad2, Star, Save, Trash2, Edit2, Check,
+  Sparkles, Loader2, Bot, ArrowDownAZ, Camera, Cloud, CloudUpload, CloudOff, Info, Filter
+} from 'lucide-react';
 
+// --- Firebase Imports ---
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+
+// --- Firebase Initialization ---
+let app, auth, db, appId;
+const initFirebase = () => {
+  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+    try {
+      const firebaseConfig = JSON.parse(__firebase_config);
+      app = initializeApp(firebaseConfig);
+      auth = getAuth(app);
+      db = getFirestore(app);
+      appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+      return true;
+    } catch (error) {
+      console.error("Firebase init failed:", error);
+      return false;
+    }
+  }
+  return false;
+};
+const isFirebaseEnabled = initFirebase();
+
+// 初期データ
+const INITIAL_GAMES = [
+  { id: '1', title: 'スプラトゥーン3', genre: 'シューティング', score: 95 },
+  { id: '2', title: 'ゼルダの伝説 ティアーズ オブ ザ キングダム', genre: 'アドベンチャー', score: 98 },
+  { id: '3', title: '大乱闘スマッシュブラザーズ SPECIAL', genre: 'アクション', score: 95 },
+  { id: '4', title: 'マリオカート8 デラックス', genre: 'レース', score: 88 },
+  { id: '5', title: 'APEX Legends', genre: 'シューティング', score: 90 },
+  { id: '6', title: 'スーパーマリオ オデッセイ', genre: 'アクション', score: 92 }
+];
+
+export default function App() {
+  // --- States ---
+  const [games, setGames] = useState(INITIAL_GAMES);
+  const [draggedItemIndex, setDraggedItemIndex] = useState(null);
+  const [calculatedRanks, setCalculatedRanks] = useState([]);
+  
+  // ジャンルフィルター用 State
+  const [selectedGenre, setSelectedGenre] = useState('ALL');
+
+  // Firebase & Auth States
+  const [user, setUser] = useState(null);
+  const [syncStatus, setSyncStatus] = useState('offline');
+  
+  // UI & Form States
+  const [isAdding, setIsAdding] = useState(false);
+  const [newTitle, setNewTitle] = useState('');
+  const [newGenre, setNewGenre] = useState('');
+  const [newScore, setNewScore] = useState('');
+  
+  const [editingId, setEditingId] = useState(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editGenre, setEditGenre] = useState('');
+  const [editScore, setEditScore] = useState('');
+
+  // AI & Image Export States
+  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [aiResult, setAiResult] = useState('');
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [toastMessage, setToastMessage] = useState('');
+
+  // --- Derived Data (派生データ) ---
+  // 登録されているゲームからユニークなジャンルのリストを作成
+  const availableGenres = ['ALL', ...Array.from(new Set(games.map(g => g.genre).filter(Boolean)))];
+  
+  // 選択中のジャンルでフィルタリングされたリスト
+  const displayedGames = selectedGenre === 'ALL' 
+    ? games 
+    : games.filter(g => g.genre === selectedGenre);
+
+  // --- Effects ---
+
+  // 1. html2canvasの読み込み
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+    script.async = true;
+    document.body.appendChild(script);
+  }, []);
+
+  // 2. Firebase 認証
+  useEffect(() => {
+    if (!isFirebaseEnabled || !auth) return;
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.error("Auth error", e);
+        setSyncStatus('error');
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // 3. データ取得
+  useEffect(() => {
+    if (!user || !db || !isFirebaseEnabled) return;
+    setSyncStatus('syncing');
+    const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'gameRanking', 'myList');
+    
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.games) setGames(data.games);
+        setSyncStatus('synced');
+      } else {
+        updateGamesToCloud(INITIAL_GAMES);
+      }
+    }, (error) => {
+      console.error("Firestore error", error);
+      setSyncStatus('error');
+    });
+    return () => unsubscribe();
+  }, [user]);
+
+  // 4. 同順位の計算 (displayedGames ベースで計算)
+  useEffect(() => {
+    const newRanks = [];
+    let currentRank = 1;
+    for (let i = 0; i < displayedGames.length; i++) {
+      if (i > 0 && displayedGames[i].score === displayedGames[i - 1].score) {
+        newRanks.push(currentRank);
+      } else {
+        currentRank = i + 1;
+        newRanks.push(currentRank);
+      }
+    }
+    setCalculatedRanks(newRanks);
+  }, [displayedGames]);
+
+  // トースト
+  const showToast = (message) => {
+    setToastMessage(message);
+    setTimeout(() => setToastMessage(''), 3000);
+  };
+
+  // クラウド保存
+  const updateGamesToCloud = async (newGames) => {
+    setGames(newGames);
+    if (!user || !db || !isFirebaseEnabled) return;
+    setSyncStatus('syncing');
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'gameRanking', 'myList');
+      await setDoc(docRef, { games: newGames });
+      setSyncStatus('synced');
+    } catch (e) {
+      console.error("Save error", e);
+      setSyncStatus('error');
+      showToast('保存に失敗しました');
+    }
+  };
+
+  // 画像書き出し
+  const handleExportImage = () => {
+    if (!window.html2canvas) {
+      showToast("画像生成の準備中です。");
+      return;
+    }
+    setIsCapturing(true);
+    showToast("画像を生成しています...");
+    setTimeout(() => {
+      const element = document.getElementById('ranking-capture-area');
+      if (!element) return;
+      window.html2canvas(element, { 
+        backgroundColor: '#0f172a', 
+        scale: 2, 
+        logging: false
+      }).then(canvas => {
+        const link = document.createElement('a');
+        // ファイル名にジャンル名を含める
+        const fileNameGenre = selectedGenre === 'ALL' ? '全体' : selectedGenre;
+        link.download = `my-game-ranking_${fileNameGenre}.png`;
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+        setIsCapturing(false);
+        showToast("画像をダウンロードしました！");
+      }).catch(err => {
+        setIsCapturing(false);
+        showToast("画像の生成に失敗しました。");
+      });
+    }, 200);
+  };
+
+  // ソート
+  const handleSortByScore = () => {
+    const sortedGames = [...games].sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.title.localeCompare(b.title, 'ja');
+    });
+    updateGamesToCloud(sortedGames);
+    showToast("スコア順に並べ替えました");
+  };
+
+  // ドラッグ＆ドロップ (全体表示の時のみ有効)
+  const handleDragStart = (index) => setDraggedItemIndex(index);
+  const handleDragEnter = (index) => {
+    if (draggedItemIndex === null || draggedItemIndex === index || selectedGenre !== 'ALL') return;
+    const newGames = [...games];
+    const draggedItem = newGames[draggedItemIndex];
+    newGames.splice(draggedItemIndex, 1);
+    newGames.splice(index, 0, draggedItem);
+    setDraggedItemIndex(index);
+    setGames(newGames);
+  };
+  const handleDragEnd = () => {
+    setDraggedItemIndex(null);
+    updateGamesToCloud(games);
+  };
+  const handleDragOver = (e) => e.preventDefault();
+
+  // CRUD
+  const handleAddGame = (e) => {
+    e.preventDefault();
+    if (!newTitle.trim()) return;
+    const newGame = {
+      id: Date.now().toString(),
+      title: newTitle,
+      genre: newGenre || 'ジャンル未設定',
+      score: parseInt(newScore) || 0
+    };
+    updateGamesToCloud([...games, newGame]);
+    setNewTitle(''); setNewGenre(''); setNewScore('');
+    setIsAdding(false);
+    showToast('ゲームを追加しました');
+  };
+
+  const handleDeleteGame = (id) => updateGamesToCloud(games.filter(game => game.id !== id));
+  
+  const startEditing = (game) => {
+    setEditingId(game.id);
+    setEditTitle(game.title);
+    setEditGenre(game.genre);
+    setEditScore(game.score.toString());
+  };
+
+  const saveEdit = () => {
+    if (!editTitle.trim()) { setEditingId(null); return; }
+    updateGamesToCloud(games.map(game => 
+      game.id === editingId 
+        ? { ...game, title: editTitle, genre: editGenre, score: parseInt(editScore) || 0 }
+        : game
+    ));
+    setEditingId(null);
+  };
+
+  // AI
+  const generateWithGemini = async (prompt) => {
+    const apiKey = ""; 
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      systemInstruction: { parts: [{ text: "あなたはゲームに精通したフレンドリーなAIアシスタントです。" }] }
+    };
+    const delays = [1000, 2000, 4000, 8000, 16000];
+    for (let attempt = 0; attempt <= 5; attempt++) {
+      try {
+        const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        if (!response.ok) throw new Error('API Request Failed');
+        const data = await response.json();
+        return data.candidates?.[0]?.content?.parts?.[0]?.text || "結果を取得できませんでした。";
+      } catch (error) {
+        if (attempt === 5) return "AIへの接続でエラーが発生しました。";
+        await new Promise(res => setTimeout(res, delays[attempt]));
+      }
+    }
+  };
+
+  const handleAnalyzeRanking = async () => {
+    if (displayedGames.length === 0) return;
+    setIsAiLoading(true); setAiResult('');
+    // 選択中のジャンルに絞ったリストで分析
+    const genreText = selectedGenre === 'ALL' ? '全体' : `「${selectedGenre}」ジャンル`;
+    const gameList = displayedGames.map((g, i) => `${calculatedRanks[i]}位: ${g.title} (スコア: ${g.score})`).join('\n');
+    const result = await generateWithGemini(`以下のユーザーの${genreText}のゲームランキングを分析して、どのような傾向があるか診断してください。200文字程度で、楽しくフレンドリーな口調でお願いします。\n\n【ランキング】\n${gameList}`);
+    setAiResult(result); setIsAiLoading(false);
+  };
+
+  // UI Helpers
+  const getRankColor = (rank) => {
+    switch(rank) {
+      case 1: return 'text-yellow-400';
+      case 2: return 'text-slate-300';
+      case 3: return 'text-amber-600';
+      default: return 'text-slate-500';
+    }
+  };
+
+  const SyncStatusIcon = () => {
+    if (!isFirebaseEnabled) return <div className="text-slate-500 flex items-center gap-1"><CloudOff size={16}/><span>未保存</span></div>;
+    switch(syncStatus) {
+      case 'syncing': return <div className="text-blue-400 flex items-center gap-1 animate-pulse"><CloudUpload size={16}/><span>保存中...</span></div>;
+      case 'synced': return <div className="text-green-400 flex items-center gap-1"><Cloud size={16}/><span>保存済み</span></div>;
+      case 'error': return <div className="text-red-400 flex items-center gap-1"><CloudOff size={16}/><span>保存エラー</span></div>;
+      default: return null;
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 font-sans p-4 md:p-8 relative">
+      
+      {toastMessage && (
+        <div className="fixed top-4 left-1/2 transform -translate-x-1/2 z-50 bg-indigo-600 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 animate-in fade-in slide-in-from-top-4">
+          <Info size={18} />
+          <span className="font-bold text-sm">{toastMessage}</span>
+        </div>
+      )}
+
+      <div className="max-w-3xl mx-auto">
+        
+        {/* === 撮影用エリア === */}
+        <div id="ranking-capture-area" className={`pb-4 ${isCapturing ? 'p-8 bg-slate-900 rounded-xl' : ''}`}>
+          
+          {/* Header */}
+          <header className="mb-8 text-center relative pt-4">
+            <div className="inline-flex items-center justify-center p-3 bg-indigo-500/20 rounded-full mb-4">
+              <Trophy className="w-10 h-10 text-indigo-400" />
+            </div>
+            <h1 className="text-3xl md:text-5xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400 tracking-tight">
+              My Game Ranking
+            </h1>
+            {/* ジャンル絞り込み中の場合、タイトルにジャンル名を表示 */}
+            {selectedGenre !== 'ALL' && (
+              <h2 className="text-xl md:text-2xl font-bold text-indigo-300 mt-2">
+                - {selectedGenre} -
+              </h2>
+            )}
+            {isCapturing && (
+              <p className="text-slate-500 mt-4 font-bold text-xs uppercase tracking-widest">Created with AI Game Ranker</p>
+            )}
+          </header>
+
+          {/* ジャンルフィルタータブ (撮影時は非表示) */}
+          {!isCapturing && availableGenres.length > 1 && (
+            <div className="mb-6 flex items-center gap-2 overflow-x-auto pb-2 scrollbar-hide">
+              <Filter size={18} className="text-slate-500 flex-shrink-0" />
+              {availableGenres.map(genre => (
+                <button
+                  key={genre}
+                  onClick={() => setSelectedGenre(genre)}
+                  className={`
+                    whitespace-nowrap px-4 py-1.5 rounded-full text-sm font-medium transition-all
+                    ${selectedGenre === genre 
+                      ? 'bg-indigo-500 text-white shadow-lg shadow-indigo-500/20' 
+                      : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200 border border-slate-700'}
+                  `}
+                >
+                  {genre === 'ALL' ? 'すべて' : genre}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* ランキングリスト */}
+          <div className="space-y-3">
+            {displayedGames.length === 0 ? (
+              <div className="text-center py-12 text-slate-500 bg-slate-800/50 rounded-2xl border border-slate-700 border-dashed">
+                <Gamepad2 size={48} className="mx-auto mb-4 opacity-50" />
+                <p>このジャンルのゲームはまだありません。</p>
+              </div>
+            ) : (
+              displayedGames.map((game, index) => {
+                const rank = calculatedRanks[index];
+                const isTied = (index > 0 && displayedGames[index].score === displayedGames[index-1].score) || 
+                               (index < displayedGames.length - 1 && displayedGames[index].score === displayedGames[index+1].score);
+
+                return (
+                  <div
+                    key={game.id}
+                    // ドラッグは「すべて(ALL)」表示時のみ許可（順序バグを防ぐため）
+                    draggable={!isCapturing && editingId === null && selectedGenre === 'ALL'}
+                    onDragStart={() => handleDragStart(games.findIndex(g => g.id === game.id))}
+                    onDragEnter={() => handleDragEnter(games.findIndex(g => g.id === game.id))}
+                    onDragEnd={handleDragEnd}
+                    onDragOver={handleDragOver}
+                    className={`
+                      group bg-slate-800 border rounded-xl p-4 flex items-center gap-4 transition-all
+                      ${draggedItemIndex === games.findIndex(g => g.id === game.id) ? 'opacity-40 scale-95 border-indigo-500' : 'border-slate-700'}
+                      ${!isCapturing && 'hover:border-slate-500'}
+                      ${editingId === game.id ? 'ring-2 ring-indigo-500' : ''}
+                    `}
+                  >
+                    {/* ドラッグハンドル */}
+                    {!isCapturing && (
+                      <div className={`p-2 hidden sm:block ${selectedGenre === 'ALL' ? 'cursor-grab active:cursor-grabbing text-slate-600 hover:text-slate-300' : 'text-slate-700 cursor-not-allowed opacity-30'}`}
+                           title={selectedGenre !== 'ALL' ? '並べ替えは「すべて」タブでのみ可能です' : 'ドラッグして並べ替え'}
+                      >
+                        <GripVertical size={20} />
+                      </div>
+                    )}
+
+                    {/* 順位 */}
+                    <div className="flex-shrink-0 w-14 flex flex-col items-center justify-center">
+                      <div className={`font-black text-2xl ${getRankColor(rank)}`}>{rank}</div>
+                      {isTied && <span className="text-[10px] text-slate-500 font-bold">同順位</span>}
+                    </div>
+
+                    {/* コンテンツ */}
+                    <div className="flex-grow min-w-0 border-l border-slate-700 pl-4">
+                      {editingId === game.id ? (
+                        <div className="grid grid-cols-1 md:grid-cols-12 gap-2">
+                          <div className="md:col-span-6"><input type="text" value={editTitle} onChange={(e) => setEditTitle(e.target.value)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white" autoFocus /></div>
+                          <div className="md:col-span-4"><input type="text" value={editGenre} onChange={(e) => setEditGenre(e.target.value)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white" placeholder="ジャンル" /></div>
+                          <div className="md:col-span-2"><input type="number" value={editScore} onChange={(e) => setEditScore(e.target.value)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white" placeholder="スコア" /></div>
+                        </div>
+                      ) : (
+                        <div>
+                          <h3 className="font-bold text-lg text-slate-100 truncate">{game.title}</h3>
+                          <div className="flex items-center gap-3 mt-1 text-xs">
+                            <span className="bg-slate-700 text-slate-300 px-2 py-0.5 rounded-md">{game.genre}</span>
+                            <span className="flex items-center gap-1 text-amber-400 bg-amber-400/10 px-2 py-0.5 rounded-md font-bold">
+                              <Star size={12} className="fill-amber-400" />{game.score}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* アクション */}
+                    {!isCapturing && (
+                      <div className="flex-shrink-0 flex items-center gap-1 opacity-100 sm:opacity-0 group-hover:opacity-100 transition-opacity">
+                        {editingId === game.id ? (
+                           <button onClick={saveEdit} className="p-2 text-green-400 hover:bg-green-400/10 rounded-lg"><Check size={18} /></button>
+                        ) : (
+                          <>
+                            <button onClick={() => startEditing(game)} className="p-2 text-slate-400 hover:text-blue-400 hover:bg-blue-400/10 rounded-lg"><Edit2 size={18} /></button>
+                            <button onClick={() => handleDeleteGame(game.id)} className="p-2 text-slate-400 hover:text-red-400 hover:bg-red-400/10 rounded-lg"><Trash2 size={18} /></button>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* コントロールパネル */}
+        {!isCapturing && (
+          <div className="mt-8 space-y-6">
+            <div className="bg-slate-800 rounded-2xl p-4 shadow-lg border border-slate-700 flex flex-wrap justify-between items-center gap-4">
+              <div className="flex items-center gap-4 text-sm font-bold">
+                <SyncStatusIcon />
+                <span className="text-slate-400">表示中 <span className="text-indigo-400 text-lg">{displayedGames.length}</span> 本</span>
+              </div>
+              
+              <div className="flex flex-wrap gap-2">
+                <button onClick={handleExportImage} className="flex items-center gap-2 bg-gradient-to-r from-pink-500 to-rose-500 hover:from-pink-400 hover:to-rose-400 text-white px-4 py-2 rounded-lg font-bold shadow-lg transition-all active:scale-95">
+                  <Camera size={18} /><span className="hidden sm:inline">画像でシェア</span>
+                </button>
+                <button onClick={handleSortByScore} className="flex items-center gap-2 bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-lg font-medium transition-colors">
+                  <ArrowDownAZ size={18} /><span className="hidden sm:inline">スコア順</span>
+                </button>
+                <button onClick={() => setIsAdding(!isAdding)} className="flex items-center gap-2 bg-indigo-500 hover:bg-indigo-600 text-white px-4 py-2 rounded-lg font-medium transition-colors">
+                  {isAdding ? <X size={18} /> : <Plus size={18} />}<span className="hidden sm:inline">{isAdding ? '閉じる' : '追加'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 追加フォーム */}
+            {isAdding && (
+              <form onSubmit={handleAddGame} className="bg-slate-800 rounded-2xl p-6 shadow-xl border-2 border-indigo-500/50 animate-in fade-in slide-in-from-top-4">
+                <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                  <Gamepad2 className="text-indigo-400" size={20} />新しいゲームを追加
+                </h3>
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+                  <div className="md:col-span-6"><label className="block text-xs text-slate-400 mb-1">タイトル *</label><input type="text" required value={newTitle} onChange={(e) => setNewTitle(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-slate-100" /></div>
+                  <div className="md:col-span-4">
+                    <label className="block text-xs text-slate-400 mb-1">ジャンル</label>
+                    <input type="text" value={newGenre} onChange={(e) => setNewGenre(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-slate-100" list="genre-list" placeholder="入力または選択" />
+                    {/* ジャンル入力のサジェスト */}
+                    <datalist id="genre-list">
+                      {availableGenres.filter(g => g !== 'ALL').map(g => <option key={g} value={g} />)}
+                    </datalist>
+                  </div>
+                  <div className="md:col-span-2"><label className="block text-xs text-slate-400 mb-1">スコア</label><input type="number" value={newScore} onChange={(e) => setNewScore(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-slate-100" placeholder="0" /></div>
+                </div>
+                <div className="mt-4 flex justify-end">
+                  <button type="submit" className="bg-indigo-500 hover:bg-indigo-600 text-white px-6 py-2 rounded-lg font-bold flex items-center gap-2"><Save size={18} /> 保存</button>
+                </div>
+              </form>
+            )}
+
+            {/* AI機能パネル */}
+            <div className="bg-gradient-to-r from-indigo-900/30 to-purple-900/30 rounded-2xl p-5 border border-indigo-500/30">
+              <div className="flex flex-col md:flex-row items-center justify-between gap-4 mb-4">
+                <div className="flex items-center gap-2 text-indigo-300 font-bold">
+                  <Bot size={24} /><span>AI ゲーマーアシスタント</span>
+                </div>
+                <button onClick={handleAnalyzeRanking} disabled={isAiLoading || displayedGames.length === 0} className="flex items-center gap-2 bg-indigo-600/80 hover:bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50">
+                  <Sparkles size={16} /> {selectedGenre === 'ALL' ? 'ランキングを分析' : `「${selectedGenre}」を分析`}
+                </button>
+              </div>
+              
+              {(isAiLoading || aiResult) && (
+                <div className="bg-slate-900/70 rounded-xl p-4 border border-indigo-500/20">
+                  {isAiLoading ? (
+                    <div className="flex flex-col items-center justify-center py-6 text-indigo-400">
+                      <Loader2 className="animate-spin mb-3" size={32} />
+                      <p className="text-sm font-medium animate-pulse">思考中...</p>
+                    </div>
+                  ) : (
+                    <div className="text-slate-200 text-sm md:text-base leading-relaxed whitespace-pre-wrap">{aiResult}</div>
+                  )}
+                </div>
+              )}
+            </div>
+            
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
